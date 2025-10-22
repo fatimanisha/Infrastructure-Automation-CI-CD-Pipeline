@@ -1,0 +1,103 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  ACR_NAME: 'TerraformContainerDemo'
+  IMAGE_NAME: 'my-app'
+  TF_PATH: 'terraform'
+  DOCKERFILE_PATH: 'app/Dockerfile'
+  AKS_CLUSTER_NAME: 'myAKSCluster'
+  RESOURCE_GROUP: 'myResourceGroup' 
+
+stages:
+  - stage: ProvisionInfrastructure
+    jobs:
+      - job: TerraformApply
+        displayName: 'Provision ACR and AKS with Terraform'
+        steps:
+          - checkout: self
+          
+          # Step to run Terraform commands
+          - task: AzureCLI@2
+            displayName: 'Run Terraform'
+            inputs:
+              azureSubscription: 'Project Connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                cd $(TF_PATH)
+                terraform init
+                terraform apply -auto-approve
+
+  - stage: BuildAndPush
+    dependsOn: ProvisionInfrastructure
+    jobs:
+      - job: BuildAndPushDocker
+        displayName: 'Build and Push Docker Image'
+        steps:
+          - checkout: self
+
+          # Step to log in to ACR
+          - task: AzureCLI@2
+            displayName: 'Log in to ACR'
+            inputs:
+              azureSubscription: 'Project Connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az acr login --name $(ACR_NAME)
+
+          # Step to build and push Docker image
+          - task: Docker@2
+            displayName: 'Build and Push Docker Image'
+            inputs:
+              containerRegistry: 'Docker-Connection'
+              repository: $(IMAGE_NAME)
+              command: 'buildAndPush'
+              Dockerfile: $(DOCKERFILE_PATH)
+              tags: $(Build.BuildId)  # Tag the image with the build ID
+
+  - stage: DeployToAKS
+    dependsOn: BuildAndPush
+    jobs:
+      - job: DeployToKubernetes
+        displayName: 'Deploy Docker Image to AKS'
+        steps:
+          - checkout: self
+
+          # Get AKS credentials
+          - task: AzureCLI@2
+            displayName: 'Get AKS Credentials'
+            inputs:
+              azureSubscription: 'Project Connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az aks get-credentials --resource-group $(RESOURCE_GROUP) --name $(AKS_CLUSTER_NAME)
+
+        # Define the image name with the Build ID as a tag
+          - task: Bash@3
+            displayName: 'Update Deployment Image'
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "Using image reference: terraformcontainerdemo.azurecr.io/my-app:$(Build.BuildId)"
+                # Substitute $(Build.BuildId) with actual build ID in deployemnt.yml
+                sed -i "s|terraformcontainerdemo.azurecr.io/my-app:latest|terraformcontainerdemo.azurecr.io/my-app:$(Build.BuildId)|" $(System.DefaultWorkingDirectory)/deployment.yml
+
+        # Apply the updated deployment       
+          - task: Kubernetes@1
+            displayName: 'Deploy to kubernetes'
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceEndpoint: 'Kubernetes-Service-Connection'
+              command: 'apply'
+              secretType: 'dockerRegistry'
+              containerRegistryType: 'Azure Container Registry'
+              useConfigurationFile: true
+              configuration: '$(System.DefaultWorkingDirectory)/deployment.yml'
